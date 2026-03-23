@@ -3,8 +3,8 @@
 #include "librim/context.hpp"
 #include "librim/expected.hpp"
 #include <boost/asio.hpp>
+#include <boost/circular_buffer.hpp>
 #include <boost/lockfree/queue.hpp>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <span>
@@ -19,8 +19,8 @@ namespace librim
  * @class UdpEndpoint
  * @brief Thread-safe and lock-free Asynchronous UDP Socket wrapper.
  *
- * Facilitates sending UDP datagrams to specific hosts, bonding to local ports, 
- * and subscribing to strictly-IPv4 high-performance Multicast UDP groups. 
+ * Facilitates sending UDP datagrams to specific hosts, bonding to local ports,
+ * and subscribing to strictly-IPv4 high-performance Multicast UDP groups.
  * Employs a custom `boost::lockfree::queue` memory pipeline eliminating `mutex_lock` delays.
  */
 class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
@@ -41,6 +41,14 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
         : context_(context), socket_(context.asio_context()),
           strand_(boost::asio::make_strand(context.asio_context().get_executor()))
     {
+        // Pre-allocate completely isolated memory mapping topologies perfectly dropping OS allocations later
+        for (int i = 0; i < 8192; ++i)
+        {
+            auto *item = new UdpSendItem();
+            item->buf = new std::vector<std::byte>();
+            item->buf->reserve(65536); // Maximum UDP size capacity seamlessly
+            buffer_pool_.push(item);
+        }
     }
 
     /**
@@ -60,7 +68,7 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
         }
         for (auto &item : send_queue_)
         {
-            delete item.buf;
+            delete item->buf;
         }
         send_queue_.clear();
     }
@@ -89,7 +97,7 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
     /**
      * @brief Configures a default target address for implicitly addressed `send()` calls.
      *
-     * In UDP, "connect" does not establish a handshake! It merely caches the IP routing 
+     * In UDP, "connect" does not establish a handshake! It merely caches the IP routing
      * metadata deeply inside the active OS socket to eliminate DNS lookups during high-speed blasts.
      *
      * @param host Address/URL mapping (IPv4 natively assumed).
@@ -183,23 +191,23 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
 
         socket_.async_receive_from(
             boost::asio::buffer(recv_buffer_), sender_endpoint_,
-            boost::asio::bind_executor(strand_, [self = shared_from_this()](boost::system::error_code ec,
-                                                                           std::size_t bytes_recvd) {
-                if (!ec && bytes_recvd > 0)
-                {
-                    std::span<const std::byte> data(reinterpret_cast<const std::byte *>(self->recv_buffer_.data()),
-                                                    bytes_recvd);
-                    self->receive_callback_(data, self->sender_endpoint_);
-                    
-                    // Recursive ingestion loop chaining
-                    self->start_receive();
-                }
-                else if (ec && ec != boost::asio::error::operation_aborted)
-                {
-                    spdlog::warn("[UdpEndpoint] Receive error: {}", ec.message());
-                    self->start_receive(); // Retry on transient UDP buffer dropout errors
-                }
-            }));
+            boost::asio::bind_executor(
+                strand_, [self = shared_from_this()](boost::system::error_code ec, std::size_t bytes_recvd) {
+                    if (!ec && bytes_recvd > 0)
+                    {
+                        std::span<const std::byte> data(reinterpret_cast<const std::byte *>(self->recv_buffer_.data()),
+                                                        bytes_recvd);
+                        self->receive_callback_(data, self->sender_endpoint_);
+
+                        // Recursive ingestion loop chaining
+                        self->start_receive();
+                    }
+                    else if (ec && ec != boost::asio::error::operation_aborted)
+                    {
+                        spdlog::warn("[UdpEndpoint] Receive error: {}", ec.message());
+                        self->start_receive(); // Retry on transient UDP buffer dropout errors
+                    }
+                }));
     }
 
     /**
@@ -226,18 +234,22 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
         if (!socket_.is_open())
             return librim::unexpected(boost::asio::error::bad_descriptor);
 
-        std::vector<std::byte> *buf_ptr = nullptr;
-        if (!buffer_pool_.pop(buf_ptr))
+        UdpSendItem *item = nullptr;
+
+        while (!buffer_pool_.pop(item))
         {
-            // Dynamically allocate when lock-free queues fall behind extreme throughput spikes!
-            buf_ptr = new std::vector<std::byte>();
+            // Backpressure logic absolutely suspending the calling loop when OS transitions stack too heavily
+            std::this_thread::yield();
         }
-        buf_ptr->assign(data.begin(), data.end());
+
+        item->buf->resize(data.size());
+        std::memcpy(item->buf->data(), data.data(), data.size());
+        item->target = target;
 
         // Context-Switch explicitly moving into the Strand boundaries securely
-        boost::asio::post(strand_, [self = shared_from_this(), buf_ptr, target]() mutable {
+        boost::asio::post(strand_, [self = shared_from_this(), item]() mutable {
             bool start_write = self->send_queue_.empty();
-            self->send_queue_.push_back({buf_ptr, target});
+            self->send_queue_.push_back(item);
             if (start_write)
             {
                 self->do_write();
@@ -270,16 +282,19 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
      */
     void do_write()
     {
+
+
         socket_.async_send_to(
-            boost::asio::buffer(*send_queue_.front().buf), send_queue_.front().target,
+            boost::asio::buffer(*(send_queue_.front()->buf)), send_queue_.front()->target,
             boost::asio::bind_executor(strand_, [self = shared_from_this()](boost::system::error_code ec, std::size_t) {
                 // Free parameters actively back into the lock-free state engine
-                auto *buf_ptr = self->send_queue_.front().buf;
+                auto *item = self->send_queue_.front();
                 self->send_queue_.pop_front();
 
-                if (!self->buffer_pool_.push(buf_ptr))
+                if (!self->buffer_pool_.push(item))
                 {
-                    delete buf_ptr;
+                    delete item->buf;
+                    delete item;
                 }
 
                 if (!ec && !self->send_queue_.empty())
@@ -310,8 +325,8 @@ class UdpEndpoint : public std::enable_shared_from_this<UdpEndpoint>
         boost::asio::ip::udp::endpoint target;
     };
 
-    boost::lockfree::queue<std::vector<std::byte> *> buffer_pool_{1024}; ///< Highly scalable pool boundary
-    std::deque<UdpSendItem> send_queue_;
+    boost::lockfree::queue<UdpSendItem *> buffer_pool_{8192}; ///< Statically populated pool boundary
+    boost::circular_buffer<UdpSendItem *> send_queue_{8192};  ///< Dense ring-buffer matching limit scales natively
 };
 
 } // namespace librim

@@ -6,16 +6,16 @@ This document delves into the internal mechanics of `librim`. It is intended for
 
 ## 1. Core Principles & Concurrency Model
 
-### Boost.ASIO & The [Context](file:///home/urbana/Projects/librim/include/librim/context.hpp#19-95) Object
+### Boost.ASIO & The [Context](include/librim/context.hpp#L19-L95) Object
 At the absolute center of the library sits the `librim::Context`. It manages a single `boost::asio::io_context` and a pool of native `std::thread` workers. 
-Rather than creating separate threads for reading, writing, and polling explicitly, `librim` leans on the Proactor design pattern. The OS asynchronously notifies the `io_context` when physical sockets have data or when writes finish, and the context delegates the associated completion callbacks ("handlers") to *any* available thread in the [Context](file:///home/urbana/Projects/librim/include/librim/context.hpp#19-95) pool.
+Rather than creating separate threads for reading, writing, and polling explicitly, `librim` leans on the Proactor design pattern. The OS asynchronously notifies the `io_context` when physical sockets have data or when writes finish, and the context delegates the associated completion callbacks ("handlers") to *any* available thread in the [Context](include/librim/context.hpp#L19-L95) pool.
 
 ### The Problem with Mutexes
 Because handlers can be invoked by any thread randomly, standard object state (like a client's specific socket buffer, active timers, or send queues) is highly susceptible to race conditions. The legacy approach is to wrap all state inside a large `std::mutex`. As identified in prior profiling, massive concurrency causes severe mutex contention (threads stall waiting to acquire locks to simply push a byte array to a socket).
 
 ### The Solution: ASIO Strands
-Instead of `mutex`, `librim` assigns a `boost::asio::strand` to every single [TcpConnection](file:///home/urbana/Projects/librim/include/librim/tcp_server.hpp#47-69), [TcpClient](file:///home/urbana/Projects/librim/include/librim/tcp_client.hpp#48-67), and [UdpEndpoint](file:///home/urbana/Projects/librim/include/librim/udp_endpoint.hpp#26-316) internally.
-A "strand" strictly guarantees that execution handlers posted to it will run **sequentially**, never concurrently. Even if 10 threads try to trigger a [do_write](file:///home/urbana/Projects/librim/include/librim/tcp_server.hpp#151-180) callback simultaneously, the strand explicitly orchestrates them so exactly 1 executes at a time for that specific socket. This inherently makes all internal socket state (buffers, queues, and timers) completely thread-safe without ever blocking execution via kernel-level `mutex` suspensions.
+Instead of `mutex`, `librim` assigns a `boost::asio::strand` to every single [TcpConnection](include/librim/tcp_server.hpp#L47-L69), [TcpClient](include/librim/tcp_client.hpp#L48-L67), and [UdpEndpoint](include/librim/udp_endpoint.hpp#L26-L316) internally.
+A "strand" strictly guarantees that execution handlers posted to it will run **sequentially**, never concurrently. Even if 10 threads try to trigger a [do_write](include/librim/tcp_server.hpp#L151-L180) callback simultaneously, the strand explicitly orchestrates them so exactly 1 executes at a time for that specific socket. This inherently makes all internal socket state (buffers, queues, and timers) completely thread-safe without ever blocking execution via kernel-level `mutex` suspensions.
 
 ---
 
@@ -23,10 +23,10 @@ A "strand" strictly guarantees that execution handlers posted to it will run **s
 
 When user code calls `client->send(data)`, the caller thread naturally executes much faster than the OS can actually push bytes through the physical NIC. Handlers must queue the outgoing memory chunks safely into an intermediate buffer sequence.
 
-If 50 UI threads concurrently call [send()](file:///home/urbana/Projects/librim/include/librim/udp_endpoint.hpp#205-216), standard `std::deque` logic would break without a mutex. To resolve this, `librim` introduces a physical `boost::lockfree::queue<std::vector<std::byte>*>`.
+If 50 UI threads concurrently call [send()](include/librim/udp_endpoint.hpp#L205-L216), standard `std::deque` logic would break without a mutex. To resolve this, `librim` introduces a physical `boost::lockfree::queue<std::vector<std::byte>*>` alongside a contiguous `boost::circular_buffer`.
 
 ### Fast-Path Memory Allocation Sequence
-When any thread attempts to broadcast, it asks the lock-free pool natively for an idle memory allocation (`pop`). If successful, the thread rapidly copies the data and posts the pointer natively to the ASIO Strand. If the pool is temporarily starved under high traffic, the calling thread simply runs `new std::vector()` locally and posts that instead. This prevents the caller from *ever* being blocked.
+When any thread attempts to broadcast, it asks the lock-free pool natively for an idle memory allocation (`pop`). If the pool is temporarily starved under high traffic, the calling thread simply yields its CPU slice explicitly (`std::this_thread::yield()`), organically backpressuring application rates to match OS kernel limits. Because the lock-free pool is strictly pre-allocated with exactly 8192 uniformly-sized buffers upon endpoint construction, `librim` completely eradicates dynamic heap allocations (`new`/`delete`) and allocator locks (`mmap`) entirely off the hot path! Once a buffer is acquired via `.pop()`, the data is statically assigned and passed to the Strand, which sequentially aggregates it inside a fixed-capacity `boost::circular_buffer` to eliminate L1 cache penalty traversals efficiently.
 
 ```mermaid
 sequenceDiagram
@@ -39,8 +39,8 @@ sequenceDiagram
     Thread->>Pool: pop()
     alt Pool has an idle buffer
         Pool-->>Thread: Returns cached vector*
-    else Pool is completely starved (High Traffic)
-        Thread->>Thread: Explicitly calls `new std::vector()`
+    else Pool is completely starved (High Traffic / Network Degraded)
+        Thread->>Thread: Yields CPU execution explicitly (`std::this_thread::yield()`) securely halting bursts
     end
     Thread->>Thread: Copies payload bytes into vector*
     Thread->>Strand: boost::asio::post( push pointer to send_queue & trigger do_write() )
@@ -66,7 +66,9 @@ sequenceDiagram
 TCP is a stream protocol; it has no concept of "messages." It only knows sequences of continuous bytes.
 `librim`'s architecture explicitly requires users to prepend packets with a fixed structural Header indicating the exact dimension of the arriving packet (e.g., standard TLV structures).
 
-The [TcpConnection](file:///home/urbana/Projects/librim/include/librim/tcp_server.hpp#47-69) instance intrinsically loops two core async behaviors bound cleanly within its explicit strand.
+The [TcpConnection](include/librim/tcp_server.hpp#L47-L69) instance intrinsically loops a continuous sliding-window ingestion mechanic bound cleanly within its explicit strand.
+
+Instead of issuing tiny individual sequential asynchronous reads for headers followed by payloads—which violently maximizes identical expensive kernel syscall mappings under heavy load—`librim` aggressively leverages a highly efficient massive `async_read_some` block slurping contiguous frame aggregations indiscriminately safely.
 
 ```mermaid
 sequenceDiagram
@@ -77,32 +79,26 @@ sequenceDiagram
     participant Socket as OS TCP Socket
 
     App->>Target: start()
-    Target->>Strand: start_receive_header() - Issues read for exactly `header_size_`
-    Strand->>Socket: boost::asio::async_read()
+    Target->>Strand: start_receive() - Allocates completely reusable 64KB boundary arrays
+    Strand->>Socket: boost::asio::async_read_some( available_buffer_capacity )
     
-    Note right of Socket: OS passively buffers physical TCP frames over time...
+    Note right of Socket: OS passively dumps hundreds of chained identical packets natively...
     
-    Socket-->>Strand: on_read_complete(header_bytes)
-    Strand->>Target: Executes user Lambda: `get_total_size(header)`
-    Target-->>Strand: Returns calculated overarching length (e.g., 1024 bytes)
-    Strand->>Strand: start_receive_payload(1024 bytes)
+    Socket-->>Strand: on_read_some(bytes_transferred)
+    Strand->>Target: process_buffer() evaluates structural invariants entirely inside memory context
+    Target->>App: Invokes user `on_receive` dynamically unpacking identically scaled `std::span` chunks seamlessly
     
-    Strand->>Socket: boost::asio::async_read() requesting (1024 - header_size) bytes
-    Socket-->>Strand: on_read_complete(payload_bytes)
-    Strand->>Target: handle_full_message(1024)
-    Target->>App: Invokes user `on_receive` passing contiguous span object
-    
-    Note left of Strand: Connection explicitly loops back identically reading for the NEXT header byte.
-    Target->>Strand: start_receive_header() (Resets State Machine)
+    Note left of Strand: Fractional incomplete slices mechanically drop back tracking internally via `std::memmove`
+    Target->>Strand: start_receive() (Loops seamlessly ingesting incoming datagram arrays)
 ```
 
 ---
 
 ## 4. Message Dispatcher Mechanics
 
-To prevent the User from having to write massive chaotic `switch/case` byte casting cascades identically evaluating different data types, `librim` features the [MessageDispatcher](file:///home/urbana/Projects/librim/include/librim/message_dispatcher.hpp#22-167).
+To prevent the User from having to write massive chaotic `switch/case` byte casting cascades identically evaluating different data types, `librim` features the [MessageDispatcher](include/librim/message_dispatcher.hpp#L22-L167).
 
-The Dispatcher is explicitly initialized with two templates: the custom `Enum` identifying packet classes securely, and the custom [Header](file:///home/urbana/Projects/librim/include/librim/async_logger.hpp#28-34) formatting defining the protocol natively.
+The Dispatcher is explicitly initialized with two templates: the custom `Enum` identifying packet classes securely, and the custom [Header](include/librim/async_logger.hpp#L28-L34) formatting defining the protocol natively.
 
 ```mermaid
 sequenceDiagram
@@ -132,4 +128,4 @@ sequenceDiagram
 Because ASIO strands process events indiscriminately across background threads, closing sockets manually crashes applications drastically natively if wait-timers or `async_send_to` calls overlap with the `delete` of the native File Descriptor securely routing them.
 
 **Librim solves this structurally:**
-All [close()](file:///home/urbana/Projects/librim/include/librim/udp_endpoint.hpp#249-266) hooks are explicitly redirected into the protective Strand execution layer natively via `boost::asio::dispatch(strand_, ...)`. This guarantees the asynchronous loop physically finishes resolving the active network block logic entirely before deleting the connection handles gracefully!
+All [close()](include/librim/udp_endpoint.hpp#L249-L266) hooks are explicitly redirected into the protective Strand execution layer natively via `boost::asio::dispatch(strand_, ...)`. This guarantees the asynchronous loop physically finishes resolving the active network block logic entirely before deleting the connection handles gracefully!

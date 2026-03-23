@@ -38,7 +38,8 @@ struct ClientConfig
     std::size_t header_size = 0; ///< Known constant dimension of the unified application Header.
     std::function<std::size_t(std::span<const std::byte>)> get_total_size = {}; ///< Header dimension translating hook.
     std::size_t max_message_size = 10 * 1024 * 1024; ///< 10MB Default limit natively protecting against payload sizes.
-    std::chrono::milliseconds read_timeout{0};       ///< 0 means no timeout natively. Drop connections stalling beyond context.
+    std::chrono::milliseconds read_timeout{
+        0}; ///< 0 means no timeout natively. Drop connections stalling beyond context.
 };
 
 /**
@@ -54,7 +55,7 @@ struct ServerConfig
     std::size_t header_size = 0; ///< Constant dimension mapped dynamically from initial blocks.
     std::function<std::size_t(std::span<const std::byte>)> get_total_size = {}; ///< Executable hook bounding arrays.
     std::size_t max_message_size = 10 * 1024 * 1024; ///< 10MB Default DoS prevention mechanism statically applied.
-    std::chrono::milliseconds read_timeout{0};       ///< 0 means no timeout. Controls native socket staleness overrides.
+    std::chrono::milliseconds read_timeout{0}; ///< 0 means no timeout. Controls native socket staleness overrides.
 };
 
 /**
@@ -77,7 +78,8 @@ class Factory
 {
   public:
     /**
-     * @brief Spawns a disconnected TcpClient logically. Call `connect` externally to instantiate physical socket bounds.
+     * @brief Spawns a disconnected TcpClient logically. Call `connect` externally to instantiate physical socket
+     * bounds.
      * @param context Active ASIO loop mechanism logically running the system.
      * @param config Parameters.
      * @return Logically instantiated shared instance.

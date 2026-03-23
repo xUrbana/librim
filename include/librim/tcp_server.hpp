@@ -4,7 +4,7 @@
 #include "librim/expected.hpp"
 #include <boost/asio.hpp>
 #include <boost/lockfree/queue.hpp>
-#include <deque>
+#include <boost/circular_buffer.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -65,6 +65,14 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     {
         // Mass allocation to easily fit vast majorities of packet sizes natively
         recv_buffer_.resize(65536);
+
+        // Pre-allocate exactly sized memory payloads fully populating the lock-free pool statically.
+        for (int i = 0; i < 8192; ++i)
+        {
+            auto *v = new std::vector<std::byte>();
+            v->reserve(65536); // Support large TCP payloads seamlessly without extending boundaries
+            buffer_pool_.push(v);
+        }
     }
 
     /**
@@ -89,7 +97,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     void start()
     {
         reset_read_timeout();
-        start_receive_header();
+        start_receive();
     }
 
     /**
@@ -105,13 +113,16 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
 
         std::vector<std::byte> *buf_ptr = nullptr;
 
-        // 1. Pop an idle buffer block from our zero-lock MPSC queue
-        if (!buffer_pool_.pop(buf_ptr))
+        // 1. Instantly pop from IDLE array or forcefully invoke Backpressure yielding if saturated!
+        while (!buffer_pool_.pop(buf_ptr))
         {
-            // 2. Pool empty/congested: fallback into explicit dynamic allocation
-            buf_ptr = new std::vector<std::byte>();
+            // Crucial: OS thread-yield completely halts `while(running)` OOM starvation safely
+            std::this_thread::yield();
         }
-        buf_ptr->assign(data.begin(), data.end());
+
+        // Populate the physical dispatch memory scaling cleanly over pre-allocated arrays
+        buf_ptr->resize(data.size());
+        std::memcpy(buf_ptr->data(), data.data(), data.size());
 
         // Subordinate the active socket processing block to the Strand thread context
         boost::asio::post(strand_, [self = shared_from_this(), buf_ptr]() mutable {
@@ -149,94 +160,67 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
 
   private:
     /**
-     * @brief Contiguous recursive loop blasting elements into the network card.
+     * @brief Processes queued payloads natively mapping them dynamically into Scatter Arrays bounding TCP arrays globally.
      */
     void do_write()
     {
+
+
+        write_buffers_.clear();
+        active_writes_ = 0;
+
+        for (auto *buf_ptr : send_queue_)
+        {
+            if (active_writes_ >= 512) break; // Arbitrary Scatter Gather batch limit
+            write_buffers_.push_back(boost::asio::buffer(*buf_ptr));
+            active_writes_++;
+        }
+
         boost::asio::async_write(
-            socket_, boost::asio::buffer(*send_queue_.front()),
+            socket_, write_buffers_,
             boost::asio::bind_executor(strand_, [self = shared_from_this()](boost::system::error_code ec, std::size_t) {
-                if (ec)
+                
+                // Free parameters actively back into the lock-free state engine
+                for (std::size_t i = 0; i < self->active_writes_; ++i)
+                {
+                    auto *buf_ptr = self->send_queue_.front();
+                    self->send_queue_.pop_front();
+
+                    if (!self->buffer_pool_.push(buf_ptr))
+                    {
+                        delete buf_ptr;
+                    }
+                }
+
+                if (!ec && !self->send_queue_.empty())
+                {
+                    self->do_write();
+                }
+                else if (ec)
                 {
                     self->close();
-                    return;
-                }
-
-                auto *buf_ptr = self->send_queue_.front();
-                self->send_queue_.pop_front();
-
-                // Deposit memory allocations securely back to wait limits
-                if (!self->buffer_pool_.push(buf_ptr))
-                {
-                    delete buf_ptr; // Physical drop
-                }
-
-                if (!self->send_queue_.empty())
-                {
-                    self->do_write(); // Recursion guarantees sequence order
                 }
             }));
     }
 
     /**
-     * @brief Primary entryhook parsing `header_size_` inputs constantly off the IP socket.
+     * @brief Initiates a massive kernel read slurping continuous array volumes into the memory buffer directly.
      */
-    void start_receive_header()
+    void start_receive()
     {
-        if (recv_buffer_.size() < header_size_)
+        // Guarantee buffer has space to read large native kernel payloads natively 
+        if (recv_buffer_.size() < active_bytes_ + 65536)
         {
-            recv_buffer_.resize(header_size_);
+            recv_buffer_.resize(active_bytes_ + 65536);
         }
 
-        boost::asio::async_read(
-            socket_, boost::asio::buffer(recv_buffer_.data(), header_size_),
-            boost::asio::bind_executor(
-                strand_, [self = shared_from_this()](boost::system::error_code ec, std::size_t bytes_recvd) {
-                    if (!ec && bytes_recvd == self->header_size_)
-                    {
-                        std::span<const std::byte> header_span(
-                            reinterpret_cast<const std::byte *>(self->recv_buffer_.data()), self->header_size_);
-                        std::size_t total_size = self->get_total_size_(header_span);
-
-                        // Protect against oversized inputs potentially stalling memory
-                        if (total_size < self->header_size_ || total_size > self->max_message_size_)
-                        {
-                            self->close();
-                            return;
-                        }
-
-                        if (self->recv_buffer_.size() < total_size)
-                        {
-                            self->recv_buffer_.resize(total_size);
-                        }
-                        self->start_receive_payload(total_size);
-                    }
-                    else
-                    {
-                        self->close();
-                    }
-                }));
-    }
-
-    /**
-     * @brief Secondary entryhook slurping remaining payload bytes once boundary length is calculated natively.
-     */
-    void start_receive_payload(std::size_t total_size)
-    {
-        std::size_t payload_size = total_size - header_size_;
-        if (payload_size == 0)
-        {
-            handle_full_message(total_size);
-            return;
-        }
-
-        boost::asio::async_read(
-            socket_, boost::asio::buffer(recv_buffer_.data() + header_size_, payload_size),
-            boost::asio::bind_executor(strand_, [self = shared_from_this(), total_size](boost::system::error_code ec,
-                                                                                        std::size_t bytes_recvd) {
-                if (!ec && bytes_recvd == (total_size - self->header_size_))
+        socket_.async_read_some(
+            boost::asio::buffer(recv_buffer_.data() + active_bytes_, recv_buffer_.size() - active_bytes_),
+            boost::asio::bind_executor(strand_, [self = shared_from_this()](boost::system::error_code ec, std::size_t bytes_recvd) {
+                if (!ec && bytes_recvd > 0)
                 {
-                    self->handle_full_message(total_size);
+                    self->active_bytes_ += bytes_recvd;
+                    self->process_buffer(); // Jump out of async callbacks into memory string processing explicitly
                 }
                 else
                 {
@@ -246,19 +230,49 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     }
 
     /**
-     * @brief Safely propagates fully materialized payloads back out to main logical code contexts.
+     * @brief Extracts identical protocol elements entirely inside physical memory skipping OS bounds completely.
      */
-    void handle_full_message(std::size_t total_size)
+    void process_buffer()
     {
-        if (on_recv_)
+        std::size_t current_offset = 0;
+
+        while (active_bytes_ - current_offset >= header_size_)
         {
-            std::span<const std::byte> full_message(reinterpret_cast<const std::byte *>(recv_buffer_.data()),
-                                                    total_size);
-            on_recv_(shared_from_this(), full_message); // Pass up stack safely
+            std::span<const std::byte> header_span(
+                reinterpret_cast<const std::byte *>(recv_buffer_.data() + current_offset), header_size_);
+            std::size_t total_size = get_total_size_(header_span);
+
+            if (total_size < header_size_ || total_size > max_message_size_)
+            {
+                close();
+                return;
+            }
+
+            if (active_bytes_ - current_offset >= total_size)
+            {
+                if (on_recv_)
+                {
+                    std::span<const std::byte> full_message(
+                        reinterpret_cast<const std::byte *>(recv_buffer_.data() + current_offset), total_size);
+                    on_recv_(shared_from_this(), full_message);
+                }
+                current_offset += total_size;
+            }
+            else
+            {
+                break; // Fractional structure incomplete; await kernel additions securely
+            }
         }
 
+        std::size_t unparsed_bytes = active_bytes_ - current_offset;
+        if (unparsed_bytes > 0 && current_offset > 0)
+        {
+            std::memmove(recv_buffer_.data(), recv_buffer_.data() + current_offset, unparsed_bytes);
+        }
+        active_bytes_ = unparsed_bytes;
+
         reset_read_timeout();
-        start_receive_header(); // loop endlessly
+        start_receive(); // Jump repeatedly natively!
     }
 
     /**
@@ -292,9 +306,12 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
 
     std::chrono::milliseconds read_timeout_; ///< Max allowed dead network limits
     boost::asio::steady_timer read_timer_;   ///< Bound passive time limit watcher
+    std::size_t active_bytes_{0};            ///< Continuous sliding buffer capacity
 
-    boost::lockfree::queue<std::vector<std::byte> *> buffer_pool_{1024}; ///< Pool recycling generic arrays
-    std::deque<std::vector<std::byte> *> send_queue_;                    ///< Tracking queued `write` orders
+    boost::lockfree::queue<std::vector<std::byte> *> buffer_pool_{8192}; ///< Statically populated pool boundary
+    boost::circular_buffer<std::vector<std::byte> *> send_queue_{8192};  ///< Massively optimized contiguous routing layout 
+    std::vector<boost::asio::const_buffer> write_buffers_;               ///< Scatter-gather pipeline structs
+    std::size_t active_writes_{0};                                       ///< Bounding native metrics trackers
 };
 
 /**

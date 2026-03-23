@@ -14,7 +14,8 @@ namespace librim
 {
 
 /**
- * @brief Role identifying whether the App natively manages active acceptor routing (Server) or outbound hooking (Client).
+ * @brief Role identifying whether the App natively manages active acceptor routing (Server) or outbound hooking
+ * (Client).
  */
 enum class AppRole
 {
@@ -28,11 +29,11 @@ enum class AppRole
  */
 struct AppConfig
 {
-    AppRole role;               ///< Active operating hierarchy assignment.
-    librim::Protocol protocol;  ///< Network structure.
-    std::string address;        ///< Domain or Target mappings for Client usages explicitly.
-    uint16_t port;              ///< Target operating socket index natively.
-    uint32_t record_id = 0;     ///< External identifier tracking origin structures generically.
+    AppRole role;              ///< Active operating hierarchy assignment.
+    librim::Protocol protocol; ///< Network structure.
+    std::string address;       ///< Domain or Target mappings for Client usages explicitly.
+    uint16_t port;             ///< Target operating socket index natively.
+    uint32_t record_id = 0;    ///< External identifier tracking origin structures generically.
 };
 
 // -------------------------------------------------------------
@@ -43,22 +44,23 @@ struct AppConfig
  * @class RimApplication
  * @brief Boilerplate-free execution framework for massive-concurrency network servers/clients.
  *
- * RimApplication consolidates Boost::ASIO Context configuration, factory layout generation, 
- * background logger injection, and strongly-typed payload Dispatcher generation inherently 
- * into a single cohesive override pattern. 
+ * RimApplication consolidates Boost::ASIO Context configuration, factory layout generation,
+ * background logger injection, and strongly-typed payload Dispatcher generation inherently
+ * into a single cohesive override pattern.
  *
  * Inherit from this class logically, implement the virtual hooks to wire behaviors cleanly!
  *
  * @tparam MsgTypeEnum Custom application logic enumerator routing the dispatcher natively.
- * @tparam HeaderStruct Standard fixed array logically framing the layout natively. 
+ * @tparam HeaderStruct Standard fixed array logically framing the layout natively.
  */
 template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
 {
   protected:
-    AppConfig config_;               ///< Active static definitions explicitly routing the node mappings.
-    librim::ServerVariant server_;   ///< Dynamically instantiated acceptor structure cleanly.
-    librim::ClientVariant client_;   ///< Explicit connection outbound variant hooks tracking allocations inherently.
-    std::shared_ptr<librim::AsyncLogger> logger_; ///< System-wide background logger securely isolating disk bottlenecks natively.
+    AppConfig config_;             ///< Active static definitions explicitly routing the node mappings.
+    librim::ServerVariant server_; ///< Dynamically instantiated acceptor structure cleanly.
+    librim::ClientVariant client_; ///< Explicit connection outbound variant hooks tracking allocations inherently.
+    std::shared_ptr<librim::AsyncLogger>
+        logger_; ///< System-wide background logger securely isolating disk bottlenecks natively.
 
     std::atomic<bool> app_running_{true}; ///< State flag holding the main process alive explicitly.
 
@@ -66,9 +68,10 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
     /**
      * @brief Bootstrapping logic explicitly hooking external dependencies immediately.
      * @param config Explicit AppConfig struct definitions.
-     * @param shared_logger (Optional) Pre-instantiated logger target enabling Cross-Application file aggregation cleanly.
+     * @param shared_logger (Optional) Pre-instantiated logger target enabling Cross-Application file aggregation
+     * cleanly.
      */
-    RimApplication(const AppConfig &config, std::shared_ptr<librim::AsyncLogger> shared_logger = nullptr) 
+    RimApplication(const AppConfig &config, std::shared_ptr<librim::AsyncLogger> shared_logger = nullptr)
         : config_(config), logger_(std::move(shared_logger))
     {
     }
@@ -83,7 +86,7 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
      * @return Subordinate HeaderExtractor cleanly defining layout extraction schemas natively.
      */
     virtual typename librim::MessageDispatcher<MsgTypeEnum, HeaderStruct>::HeaderExtractor get_extractor() = 0;
-    
+
     /**
      * @brief PURE VIRTUAL: Injection point strictly wiring network packet layouts into execution lambdas natively.
      * @param dispatcher Central router executing active callbacks mapped securely.
@@ -91,15 +94,17 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
     virtual void setup_handlers(librim::MessageDispatcher<MsgTypeEnum, HeaderStruct> &dispatcher) = 0;
 
     /**
-     * @brief VIRTUAL: Execute arbitrary triggers natively the INSTANT a client logically initiates active OSI streams successfully.
+     * @brief VIRTUAL: Execute arbitrary triggers natively the INSTANT a client logically initiates active OSI streams
+     * successfully.
      * @param client Overarching Client connection parameters safely.
      */
     virtual void on_client_connected(librim::ClientVariant & /*client*/)
     {
     } // Optional hook for clients
-    
+
     /**
-     * @brief VIRTUAL: Clean up structures strictly before the underlying network teardown cycle destroys arrays dynamically.
+     * @brief VIRTUAL: Clean up structures strictly before the underlying network teardown cycle destroys arrays
+     * dynamically.
      */
     virtual void teardown()
     {
@@ -143,10 +148,10 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
         // 1. Setup Dispatcher via virtual extractor
         auto dispatcher = std::make_shared<librim::MessageDispatcher<MsgTypeEnum, HeaderStruct>>(get_extractor());
 
-        // 2. Register handlers via virtual setup securely inherently 
+        // 2. Register handlers via virtual setup securely inherently
         setup_handlers(*dispatcher);
 
-        // 3. Setup TCP/UDP Server or Client explicitly leveraging Factory architectures natively 
+        // 3. Setup TCP/UDP Server or Client explicitly leveraging Factory architectures natively
         spdlog::info("[App] Starting {} {} on {}:{}...", (config_.protocol == librim::Protocol::TCP ? "TCP" : "UDP"),
                      (config_.role == AppRole::Server ? "Server" : "Client"), config_.address, config_.port);
 
@@ -167,7 +172,8 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
         teardown();
         context.stop();
 
-        // Critical: Sockets must be destroyed logically BEFORE the overarching ASIO Context is physically unmapped successfully.
+        // Critical: Sockets must be destroyed logically BEFORE the overarching ASIO Context is physically unmapped
+        // successfully.
         server_ = librim::ServerVariant{};
         client_ = librim::ClientVariant{};
     }
@@ -186,14 +192,15 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
             if (auto var = librim::Factory::create_tcp_server(context, cfg))
             {
                 server_ = var.value();
-                // Inject intermediate logging lambda capturing network bytes independently BEFORE logical execution safely
+                // Inject intermediate logging lambda capturing network bytes independently BEFORE logical execution
+                // safely
                 std::get<std::shared_ptr<librim::TcpServer>>(server_)->on_receive(
-                    [logger = logger_, dispatcher, record_id = config_.record_id](std::shared_ptr<librim::TcpConnection> /*conn*/,
-                                                                                  std::span<const std::byte> data) {
-                        logger->log(record_id, data);
+                    [logger = logger_, dispatcher](std::shared_ptr<librim::TcpConnection> /*conn*/,
+                                                   std::span<const std::byte> data) {
+                        // logger->log(record_id, data);
                         dispatcher->dispatch(data);
                     });
-                    
+
                 if (auto res = std::get<std::shared_ptr<librim::TcpServer>>(server_)->start(); !res)
                     spdlog::error("[App] TCP Server failed to start: {}", res.error().message());
             }
@@ -204,9 +211,9 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
             {
                 server_ = var.value();
                 std::get<std::shared_ptr<librim::UdpEndpoint>>(server_)->on_receive(
-                    [logger = logger_, dispatcher, record_id = config_.record_id](std::span<const std::byte> data,
-                                                                                  const boost::asio::ip::udp::endpoint & /*sender*/) {
-                        logger->log(record_id, data);
+                    [logger = logger_, dispatcher](std::span<const std::byte> data,
+                                                   const boost::asio::ip::udp::endpoint & /*sender*/) {
+                        // logger->log(record_id, data);
                         dispatcher->dispatch(data);
                     });
                 std::get<std::shared_ptr<librim::UdpEndpoint>>(server_)->start_receive();
@@ -229,8 +236,8 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
             {
                 client_ = var.value();
                 std::get<std::shared_ptr<librim::TcpClient>>(client_)->on_receive(
-                    [logger = logger_, dispatcher, record_id = config_.record_id](std::span<const std::byte> data) {
-                        logger->log(record_id, data);
+                    [logger = logger_, dispatcher](std::span<const std::byte> data) {
+                        // logger->log(record_id, data);
                         dispatcher->dispatch(data);
                     });
 
@@ -249,9 +256,9 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
             {
                 client_ = var.value();
                 std::get<std::shared_ptr<librim::UdpEndpoint>>(client_)->on_receive(
-                    [logger = logger_, dispatcher, record_id = config_.record_id](std::span<const std::byte> data,
-                                                                                  const boost::asio::ip::udp::endpoint & /*sender*/) {
-                        logger->log(record_id, data);
+                    [logger = logger_, dispatcher](std::span<const std::byte> data,
+                                                   const boost::asio::ip::udp::endpoint & /*sender*/) {
+                        // logger->log(record_id, data);
                         dispatcher->dispatch(data);
                     });
                 std::get<std::shared_ptr<librim::UdpEndpoint>>(client_)->start_receive();

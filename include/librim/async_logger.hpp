@@ -37,8 +37,8 @@ struct RimHeader
  * @class AsyncLogger
  * @brief Thread-safe asynchronous double-buffered binary logger.
  *
- * The AsyncLogger seamlessly decouples fast network I/O strands from the notoriously slow 
- * hard-disk sequential write bottlenecks. It employs a Multi-Producer/Single-Consumer 
+ * The AsyncLogger seamlessly decouples fast network I/O strands from the notoriously slow
+ * hard-disk sequential write bottlenecks. It employs a Multi-Producer/Single-Consumer
  * double-buffering architecture native to game engine logging.
  */
 class AsyncLogger
@@ -83,7 +83,7 @@ class AsyncLogger
     {
         if (running_.exchange(false, std::memory_order_seq_cst))
         {
-            cv_.notify_one();            // Wake up worker if it is sleeping on the cond-var
+            cv_.notify_one(); // Wake up worker if it is sleeping on the cond-var
             if (worker_.joinable())
                 worker_.join();
         }
@@ -108,8 +108,8 @@ class AsyncLogger
     /**
      * @brief Safely injects a record into the active RAM buffer alongside a generated RimHeader.
      *
-     * This method instantly calculates a timestamp, formats a `RimHeader` into Network Byte Order 
-     * (Big Endian), appends both the header and the raw payload into the generic byte buffer, 
+     * This method instantly calculates a timestamp, formats a `RimHeader` into Network Byte Order
+     * (Big Endian), appends both the header and the raw payload into the generic byte buffer,
      * and signals the background worker to awaken.
      *
      * @param record_id Origin or category ID of this network buffer.
@@ -135,19 +135,19 @@ class AsyncLogger
         {
             // Lock the active buffer precisely long enough for a contiguous bulk copy
             std::lock_guard<std::mutex> lock(mutex_);
-            
+
             // Backpressure check: aggressively drop packets instead of blowing up server RAM
             if (active_buffer_.size() + hdr_span.size() + data.size() > max_capacity_)
             {
                 dropped_logs_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            
+
             // Emplace both the newly forged header and the raw stream bytes
             active_buffer_.insert(active_buffer_.end(), hdr_span.begin(), hdr_span.end());
             active_buffer_.insert(active_buffer_.end(), data.begin(), data.end());
         }
-        
+
         // Nudge the dedicated logger thread that there is work
         cv_.notify_one();
     }
@@ -181,23 +181,23 @@ class AsyncLogger
                     file_.write(reinterpret_cast<const char *>(flush_buffer_.data()), flush_buffer_.size());
                     file_.flush();
                 }
-                
-                // Clear the buffer to reset its size to 0, but retain its underlying 
+
+                // Clear the buffer to reset its size to 0, but retain its underlying
                 // raw heap capacity to prevent `new`/`delete` thrash!
-                flush_buffer_.clear(); 
+                flush_buffer_.clear();
             }
         }
     }
 
-    size_t max_capacity_;                   ///< Hard limit of the RAM buffer before dropping incoming data.
-    std::atomic<size_t> dropped_logs_{0};   ///< Thread-safe counter of intentionally dropped records.
-    std::ofstream file_;                    ///< Binary file output stream.
-    std::vector<std::byte> active_buffer_;  ///< Buffer receiving raw network inputs immediately.
-    std::vector<std::byte> flush_buffer_;   ///< Buffer held by the background thread actively writing to disk.
-    std::mutex mutex_;                      ///< Protects the `active_buffer_` memory boundary.
-    std::condition_variable cv_;            ///< Signals the worker thread out of sleep state.
-    std::atomic<bool> running_{false};      ///< Flag cleanly shutting down the application.
-    std::thread worker_;                    ///< The allocated background POSIX thread context.
+    size_t max_capacity_;                  ///< Hard limit of the RAM buffer before dropping incoming data.
+    std::atomic<size_t> dropped_logs_{0};  ///< Thread-safe counter of intentionally dropped records.
+    std::ofstream file_;                   ///< Binary file output stream.
+    std::vector<std::byte> active_buffer_; ///< Buffer receiving raw network inputs immediately.
+    std::vector<std::byte> flush_buffer_;  ///< Buffer held by the background thread actively writing to disk.
+    std::mutex mutex_;                     ///< Protects the `active_buffer_` memory boundary.
+    std::condition_variable cv_;           ///< Signals the worker thread out of sleep state.
+    std::atomic<bool> running_{false};     ///< Flag cleanly shutting down the application.
+    std::thread worker_;                   ///< The allocated background POSIX thread context.
 };
 
 } // namespace librim
