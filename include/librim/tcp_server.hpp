@@ -364,6 +364,27 @@ class TcpServer
     }
 
     /**
+     * @brief Broadcasts the data sequence to all connected clients asynchronously.
+     * @param data Raw payload sequence aggressively transmitted lock-free over live streams.
+     */
+    void broadcast(std::span<const std::byte> data)
+    {
+        std::vector<std::shared_ptr<TcpConnection>> current_connections;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex_);
+            current_connections.reserve(connections_.size());
+            for (const auto& conn : connections_)
+            {
+                current_connections.push_back(conn);
+            }
+        }
+        for (const auto& conn : current_connections)
+        {
+            (void)conn->send(data);
+        }
+    }
+
+    /**
      * @brief Starts the listening interface pipeline dynamically generating internal streams implicitly.
      */
     [[nodiscard]] librim::expected<void, boost::system::error_code> start()

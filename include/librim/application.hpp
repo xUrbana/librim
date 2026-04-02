@@ -130,6 +130,49 @@ template <typename MsgTypeEnum, typename HeaderStruct> class RimApplication
     }
 
     /**
+     * @brief Sends a dynamically bounded payload out across the network topology implicitly.
+     * Clients dispatch strictly upstream. Servers broadcast securely across all managed sockets.
+     * @param data Generic contiguous payload completely mapped for the OSI boundaries.
+     */
+    void send(std::span<const std::byte> data)
+    {
+        if (config_.role == AppRole::Client)
+        {
+            if (config_.protocol == librim::Protocol::TCP)
+            {
+                if (auto const* ptr = std::get_if<std::shared_ptr<librim::TcpClient>>(&client_))
+                {
+                    if (*ptr) (void)(*ptr)->send(data);
+                }
+            }
+            else
+            {
+                if (auto const* ptr = std::get_if<std::shared_ptr<librim::UdpEndpoint>>(&client_))
+                {
+                    if (*ptr) (void)(*ptr)->send(data);
+                }
+            }
+        }
+        else
+        {
+            if (config_.protocol == librim::Protocol::TCP)
+            {
+                if (auto const* ptr = std::get_if<std::shared_ptr<librim::TcpServer>>(&server_))
+                {
+                    if (*ptr) (*ptr)->broadcast(data);
+                }
+            }
+            else
+            {
+                if (auto const* ptr = std::get_if<std::shared_ptr<librim::UdpEndpoint>>(&server_))
+                {
+                    if (*ptr) (void)(*ptr)->send(data);
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Core synchronous blocking orchestrator implicitly executing the pipeline logically.
      *
      * Sets up the ASIO environment natively, launches the active dispatcher structures, hooks sockets securely,
